@@ -1,41 +1,352 @@
-{
-  "expo": {
-    "name": "sandbox",
-    "slug": "sandbox",
-    "sdkVersion": "UNVERSIONED",
-    "scheme": "sandbox",
-    "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "updates": {
-      "fallbackToCacheTimeout": 0
-    },
-    "assetBundlePatterns": ["**/*"],
-    "userInterfaceStyle": "automatic",
-    "ios": {
-      "supportsTablet": true
-    },
-    "plugins": [
-      [
-        "expo-router",
-        {
-          "origin": "https://naviloop.netlify.app/",
-          "asyncRoutes": true
-        }
-      ],
-      [
-        "expo-splash-screen",
-        {
-          "image": "./assets/splash.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
-        }
-      ]
-    ],
-    "web": {
-      "bundler": "metro",
-      "output": "server"
-    }
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  SafeAreaView, View, Text, TextInput, TouchableOpacity, FlatList,
+  ScrollView, StyleSheet, Alert, StatusBar,
+} from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+
+const STORAGE_KEY = 'backlog_tracker_v1';
+const DAY = 24 * 60 * 60 * 1000;
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+/* ---------- helpers ---------- */
+const daysUntil = (dateStr) => {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d)) return null;
+  return Math.ceil((d.getTime() - Date.now()) / DAY);
+};
+
+const subjectStats = (s) => {
+  const total = s.topics.length;
+  const done = s.topics.filter((t) => t.done).length;
+  const remaining = total - done;
+  const remainingHours = s.topics.filter((t) => !t.done).reduce((a, t) => a + (Number(t.hours) || 1), 0);
+  const daysLeft = daysUntil(s.examDate);
+  const perDay = daysLeft && daysLeft > 0 ? remainingHours / daysLeft : null;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const lastDone = s.topics.reduce((m, t) => (t.doneAt && t.doneAt > m ? t.doneAt : m), 0);
+  return { total, done, remaining, remainingHours, daysLeft, perDay, pct, lastDone };
+};
+
+/* ---------- methodology engine ---------- */
+const METHODS = {
+  pomodoro: {
+    name: 'Pomodoro Sprints',
+    steps: 'Study 25 min, break 5 min. After 4 rounds take a 20 min break. Start with just 2 rounds today to build momentum.',
+  },
+  twoMinute: {
+    name: 'Two-Minute Restart',
+    steps: 'You have been inactive for a while. Open the book and do just 2 minutes on the easiest topic. Starting is the hard part; most times you will continue.',
+  },
+  pareto: {
+    name: '80/20 Triage',
+    steps: 'List remaining topics. Mark the ones with highest exam weightage or easiest marks. Finish those first, skip or skim low-value ones.',
+  },
+  crash: {
+    name: 'Crash Plan',
+    steps: 'Exam is close. Use previous-year papers: solve, check mistakes, revise only weak areas. 1 subject block of 2-3 hrs, with a 10 min break per hour.',
+  },
+  recall: {
+    name: 'Active Recall + Spaced Revision',
+    steps: 'After studying a topic, close the book and write what you remember. Revise it again after 1 day, 3 days and 7 days.',
+  },
+  feynman: {
+    name: 'Feynman Technique',
+    steps: 'Explain the topic out loud in simple words as if teaching a friend. Where you get stuck, go back and relearn that part.',
+  },
+  blocking: {
+    name: 'Subject Time-Blocking',
+    steps: 'Give each subject a fixed daily slot (e.g. Hard subject in the morning, lighter one in the evening). Do not switch subjects inside a block.',
+  },
+  mock: {
+    name: 'Mock Test & Review',
+    steps: 'You are past the halfway mark. Take a timed mock test, then spend double the time analysing mistakes.',
+  },
+  eatFrog: {
+    name: 'Eat the Frog',
+    steps: 'Do the toughest pending topic first thing, before checking your phone. Easier topics will then feel light.',
+  },
+};
+
+const buildSuggestions = (subjects) => {
+  const active = subjects
+    .map((s) => ({ s, st: subjectStats(s) }))
+    .filter((x) => x.st.remaining > 0);
+  if (!active.length) return [];
+
+  // Most urgent: highest required hours/day, else most remaining hours
+  active.sort((a, b) => (b.st.perDay ?? b.st.remainingHours / 100) - (a.st.perDay ?? a.st.remainingHours / 100));
+  const top = active[0];
+  const out = [];
+  const add = (key, why, subj = top.s.name) => out.push({ ...METHODS[key], key, why, subject: subj });
+
+  const idleDays = top.st.lastDone ? Math.floor((Date.now() - top.st.lastDone) / DAY) : null;
+  const anyActivity = Math.max(...subjects.map((s) => subjectStats(s).lastDone));
+  const globalIdle = anyActivity ? Math.floor((Date.now() - anyActivity) / DAY) : 99;
+
+  if (globalIdle >= 3) add('twoMinute', `No topic completed in ${globalIdle >= 99 ? 'a while' : globalIdle + ' days'}.`);
+  if (top.st.daysLeft !== null && top.st.daysLeft <= 7 && top.st.daysLeft >= 0)
+    add('crash', `${top.s.name} exam is in ${top.st.daysLeft} day(s).`);
+  if (top.st.perDay && top.st.perDay > 6)
+    add('pareto', `You need ~${top.st.perDay.toFixed(1)} hrs/day for ${top.s.name}. Prioritise.`);
+  if (active.length >= 3) add('blocking', `${active.length} subjects pending. Avoid constant switching.`, 'All subjects');
+
+  if (top.st.pct < 25) {
+    add('eatFrog', `${top.s.name} is only ${top.st.pct}% done.`);
+    add('pomodoro', 'Small timed sprints make a big backlog feel manageable.');
+  } else if (top.st.pct < 60) {
+    add('recall', `${top.s.name} is ${top.st.pct}% done. Lock in what you learn.`);
+    add('pomodoro', 'Keep your pace steady.');
+  } else {
+    add('mock', `${top.s.name} is ${top.st.pct}% done. Time to test yourself.`);
+    add('feynman', 'Check real understanding of the remaining topics.');
   }
+
+  // de-duplicate by key
+  const seen = new Set();
+  return out.filter((m) => (seen.has(m.key) ? false : seen.add(m.key)));
+};
+
+/* ---------- small components ---------- */
+const ProgressBar = ({ pct, color = '#4f46e5' }) => (
+  <View style={styles.barBg}>
+    <View style={[styles.barFill, { width: `${pct}%`, backgroundColor: color }]} />
+  </View>
+);
+
+const Btn = ({ title, onPress, kind = 'primary', style }) => (
+  <TouchableOpacity
+    onPress={onPress}
+    style={[styles.btn, kind === 'ghost' && styles.btnGhost, kind === 'danger' && styles.btnDanger, style]}
+  >
+    <Text style={[styles.btnText, kind === 'ghost' && { color: '#4f46e5' }]}>{title}</Text>
+  </TouchableOpacity>
+);
+
+/* ---------- main app ---------- */
+export default function App() {
+  const [subjects, setSubjects] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [openId, setOpenId] = useState(null);
+  const [sugIndex, setSugIndex] = useState(0);
+
+  // add subject form
+  const [name, setName] = useState('');
+  const [exam, setExam] = useState('');
+  // add topic form
+  const [topic, setTopic] = useState('');
+  const [hours, setHours] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(STORAGE_KEY);
+        if (raw) setSubjects(JSON.parse(raw));
+      } catch (e) {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (loaded) AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(subjects)).catch(() => {});
+  }, [subjects, loaded]);
+
+  const suggestions = useMemo(() => buildSuggestions(subjects), [subjects]);
+  const suggestion = suggestions.length ? suggestions[sugIndex % suggestions.length] : null;
+
+  const overall = useMemo(() => {
+    const all = subjects.flatMap((s) => s.topics);
+    const done = all.filter((t) => t.done).length;
+    return { total: all.length, done, pct: all.length ? Math.round((done / all.length) * 100) : 0 };
+  }, [subjects]);
+
+  const addSubject = () => {
+    if (!name.trim()) return;
+    if (exam && daysUntil(exam) === null) {
+      Alert.alert('Invalid date', 'Use format YYYY-MM-DD, e.g. 2026-12-15');
+      return;
+    }
+    setSubjects([...subjects, { id: uid(), name: name.trim(), examDate: exam.trim(), topics: [] }]);
+    setName(''); setExam('');
+  };
+
+  const deleteSubject = (id) =>
+    Alert.alert('Delete subject?', 'This removes all its topics.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: () => { setSubjects(subjects.filter((s) => s.id !== id)); setOpenId(null); } },
+    ]);
+
+  const updateSubject = (id, fn) => setSubjects(subjects.map((s) => (s.id === id ? fn(s) : s)));
+
+  const addTopic = (sid) => {
+    if (!topic.trim()) return;
+    updateSubject(sid, (s) => ({
+      ...s,
+      topics: [...s.topics, { id: uid(), title: topic.trim(), hours: Number(hours) || 1, done: false, doneAt: 0 }],
+    }));
+    setTopic(''); setHours('');
+  };
+
+  const toggleTopic = (sid, tid) =>
+    updateSubject(sid, (s) => ({
+      ...s,
+      topics: s.topics.map((t) => (t.id === tid ? { ...t, done: !t.done, doneAt: !t.done ? Date.now() : 0 } : t)),
+    }));
+
+  const removeTopic = (sid, tid) =>
+    updateSubject(sid, (s) => ({ ...s, topics: s.topics.filter((t) => t.id !== tid) }));
+
+  /* ----- subject detail screen ----- */
+  const current = subjects.find((s) => s.id === openId);
+  if (current) {
+    const st = subjectStats(current);
+    return (
+      <SafeAreaView style={styles.safe}>
+        <StatusBar barStyle="dark-content" />
+        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <TouchableOpacity onPress={() => setOpenId(null)}>
+            <Text style={styles.back}>{'< Back'}</Text>
+          </TouchableOpacity>
+          <Text style={styles.h1}>{current.name}</Text>
+          <Text style={styles.muted}>
+            {st.done}/{st.total} topics done · {st.remainingHours} hrs left
+            {st.daysLeft !== null ? ` · exam in ${st.daysLeft} day(s)` : ''}
+          </Text>
+          <ProgressBar pct={st.pct} />
+          {st.perDay ? (
+            <Text style={styles.pace}>Target: {st.perDay.toFixed(1)} hrs/day to finish before the exam</Text>
+          ) : null}
+
+          <View style={styles.card}>
+            <Text style={styles.h2}>Add topic</Text>
+            <TextInput style={styles.input} placeholder="Topic / chapter name" value={topic} onChangeText={setTopic} />
+            <TextInput
+              style={styles.input}
+              placeholder="Estimated hours (default 1)"
+              keyboardType="numeric"
+              value={hours}
+              onChangeText={setHours}
+            />
+            <Btn title="Add topic" onPress={() => addTopic(current.id)} />
+          </View>
+
+          {current.topics.map((t) => (
+            <View key={t.id} style={styles.topicRow}>
+              <TouchableOpacity style={{ flex: 1 }} onPress={() => toggleTopic(current.id, t.id)}>
+                <Text style={[styles.topicText, t.done && styles.done]}>
+                  {t.done ? '☑ ' : '☐ '}{t.title}
+                </Text>
+                <Text style={styles.muted}>{t.hours} hr(s)</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => removeTopic(current.id, t.id)}>
+                <Text style={styles.remove}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+
+          <Btn title="Delete subject" kind="danger" style={{ marginTop: 24 }} onPress={() => deleteSubject(current.id)} />
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  /* ----- home screen ----- */
+  return (
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle="dark-content" />
+      <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+        <Text style={styles.h1}>Backlog Buster</Text>
+
+        <View style={styles.card}>
+          <Text style={styles.h2}>Overall progress</Text>
+          <Text style={styles.big}>{overall.pct}%</Text>
+          <ProgressBar pct={overall.pct} color="#16a34a" />
+          <Text style={styles.muted}>{overall.done} of {overall.total} topics cleared</Text>
+        </View>
+
+        {suggestion ? (
+          <View style={[styles.card, styles.sugCard]}>
+            <Text style={styles.tag}>SUGGESTED METHOD · {suggestion.subject}</Text>
+            <Text style={styles.sugTitle}>{suggestion.name}</Text>
+            <Text style={styles.sugWhy}>{suggestion.why}</Text>
+            <Text style={styles.sugBody}>{suggestion.steps}</Text>
+            {suggestions.length > 1 && (
+              <Btn title="Show another method" kind="ghost" onPress={() => setSugIndex(sugIndex + 1)} />
+            )}
+          </View>
+        ) : (
+          <View style={styles.card}>
+            <Text style={styles.muted}>
+              {subjects.length
+                ? 'No pending topics. Great work!'
+                : 'Add your subjects and topics to get personalised study methods.'}
+            </Text>
+          </View>
+        )}
+
+        <Text style={styles.h2}>Subjects</Text>
+        {subjects.map((s) => {
+          const st = subjectStats(s);
+          return (
+            <TouchableOpacity key={s.id} style={styles.card} onPress={() => setOpenId(s.id)}>
+              <View style={styles.rowBetween}>
+                <Text style={styles.subjName}>{s.name}</Text>
+                <Text style={styles.pct}>{st.pct}%</Text>
+              </View>
+              <ProgressBar pct={st.pct} />
+              <Text style={styles.muted}>
+                {st.remaining} topic(s) left · {st.remainingHours} hrs
+                {st.daysLeft !== null ? ` · ${st.daysLeft}d to exam` : ''}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+
+        <View style={styles.card}>
+          <Text style={styles.h2}>Add subject</Text>
+          <TextInput style={styles.input} placeholder="Subject name" value={name} onChangeText={setName} />
+          <TextInput
+            style={styles.input}
+            placeholder="Exam date (YYYY-MM-DD, optional)"
+            value={exam}
+            onChangeText={setExam}
+          />
+          <Btn title="Add subject" onPress={addSubject} />
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
 }
+
+/* ---------- styles ---------- */
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#f5f6fa' },
+  container: { padding: 16, paddingBottom: 48 },
+  h1: { fontSize: 26, fontWeight: '800', color: '#111827', marginBottom: 8, marginTop: 8 },
+  h2: { fontSize: 17, fontWeight: '700', color: '#111827', marginVertical: 8 },
+  big: { fontSize: 36, fontWeight: '800', color: '#16a34a' },
+  muted: { color: '#6b7280', fontSize: 13, marginTop: 4 },
+  back: { color: '#4f46e5', fontSize: 16, marginBottom: 4 },
+  card: { backgroundColor: '#fff', borderRadius: 14, padding: 14, marginVertical: 8, elevation: 2, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 6, shadowOffset: { width: 0, height: 2 } },
+  sugCard: { backgroundColor: '#eef2ff', borderWidth: 1, borderColor: '#c7d2fe' },
+  tag: { fontSize: 11, fontWeight: '700', color: '#4f46e5', letterSpacing: 0.5 },
+  sugTitle: { fontSize: 20, fontWeight: '800', color: '#1e1b4b', marginTop: 4 },
+  sugWhy: { color: '#4338ca', marginTop: 4, fontStyle: 'italic' },
+  sugBody: { color: '#1f2937', marginVertical: 8, lineHeight: 20 },
+  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  subjName: { fontSize: 17, fontWeight: '700', color: '#111827' },
+  pct: { fontSize: 15, fontWeight: '700', color: '#4f46e5' },
+  pace: { marginTop: 8, color: '#b45309', fontWeight: '600' },
+  barBg: { height: 8, backgroundColor: '#e5e7eb', borderRadius: 6, overflow: 'hidden', marginVertical: 8 },
+  barFill: { height: 8, borderRadius: 6 },
+  input: { borderWidth: 1, borderColor: '#d1d5db', borderRadius: 10, padding: 10, marginBottom: 10, backgroundColor: '#fff' },
+  btn: { backgroundColor: '#4f46e5', borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
+  btnGhost: { backgroundColor: 'transparent', borderWidth: 1, borderColor: '#4f46e5' },
+  btnDanger: { backgroundColor: '#dc2626' },
+  btnText: { color: '#fff', fontWeight: '700' },
+  topicRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 12, padding: 12, marginVertical: 5 },
+  topicText: { fontSize: 16, color: '#111827' },
+  done: { textDecorationLine: 'line-through', color: '#9ca3af' },
+  remove: { fontSize: 18, color: '#9ca3af', paddingHorizontal: 8 },
+});
